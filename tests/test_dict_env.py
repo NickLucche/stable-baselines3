@@ -1,9 +1,12 @@
-import gym
+from typing import Dict, Optional
+
+import gymnasium as gym
 import numpy as np
 import pytest
-from gym import spaces
+from gymnasium import spaces
 
 from stable_baselines3 import A2C, DDPG, DQN, PPO, SAC, TD3
+from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.envs import BitFlippingEnv, SimpleMultiObsEnv
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -13,7 +16,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecFram
 class DummyDictEnv(gym.Env):
     """Custom Environment for testing purposes only"""
 
-    metadata = {"render.modes": ["human"]}
+    metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
@@ -28,8 +31,8 @@ class DummyDictEnv(gym.Env):
         else:
             self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
         N_CHANNELS = 1
-        HEIGHT = 64
-        WIDTH = 64
+        HEIGHT = 36
+        WIDTH = 36
 
         if channel_last:
             obs_shape = (HEIGHT, WIDTH, N_CHANNELS)
@@ -66,17 +69,36 @@ class DummyDictEnv(gym.Env):
 
     def step(self, action):
         reward = 0.0
-        done = False
-        return self.observation_space.sample(), reward, done, {}
+        terminated = truncated = False
+        return self.observation_space.sample(), reward, terminated, truncated, {}
 
-    def compute_reward(self, achieved_goal, desired_goal, info):
-        return np.zeros((len(achieved_goal),))
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
+        if seed is not None:
+            self.observation_space.seed(seed)
+        return self.observation_space.sample(), {}
 
-    def reset(self):
-        return self.observation_space.sample()
-
-    def render(self, mode="human"):
+    def render(self):
         pass
+
+
+@pytest.mark.parametrize("use_discrete_actions", [True, False])
+@pytest.mark.parametrize("channel_last", [True, False])
+@pytest.mark.parametrize("nested_dict_obs", [True, False])
+@pytest.mark.parametrize("vec_only", [True, False])
+def test_env(use_discrete_actions, channel_last, nested_dict_obs, vec_only):
+    # Check the env used for testing
+    if nested_dict_obs:
+        with pytest.warns(UserWarning, match="Nested observation spaces are not supported"):
+            check_env(DummyDictEnv(use_discrete_actions, channel_last, nested_dict_obs, vec_only))
+    else:
+        check_env(DummyDictEnv(use_discrete_actions, channel_last, nested_dict_obs, vec_only))
+
+
+@pytest.mark.parametrize("policy", ["MlpPolicy", "CnnPolicy"])
+def test_policy_hint(policy):
+    # Common mistake: using the wrong policy
+    with pytest.raises(ValueError):
+        PPO(policy, BitFlippingEnv(n_bits=4))
 
 
 @pytest.mark.parametrize("model_class", [PPO, A2C])
@@ -98,7 +120,7 @@ def test_consistency(model_class):
     dict_env = gym.wrappers.TimeLimit(dict_env, 100)
     env = gym.wrappers.FlattenObservation(dict_env)
     dict_env.seed(10)
-    obs = dict_env.reset()
+    obs, _ = dict_env.reset()
 
     kwargs = {}
     n_steps = 256
@@ -177,19 +199,19 @@ def test_dict_spaces(model_class, channel_last):
     evaluate_policy(model, env, n_eval_episodes=5, warn=False)
 
 
-@pytest.mark.parametrize("model_class", [PPO, A2C])
+@pytest.mark.parametrize("model_class", [PPO, A2C, SAC, DQN])
 def test_multiprocessing(model_class):
     use_discrete_actions = model_class not in [SAC, TD3, DDPG]
 
     def make_env():
         env = DummyDictEnv(use_discrete_actions=use_discrete_actions, channel_last=False)
-        env = gym.wrappers.TimeLimit(env, 100)
+        env = gym.wrappers.TimeLimit(env, 50)
         return env
 
     env = make_vec_env(make_env, n_envs=2, vec_env_cls=SubprocVecEnv)
 
     kwargs = {}
-    n_steps = 256
+    n_steps = 128
 
     if model_class in {A2C, PPO}:
         kwargs = dict(
@@ -198,6 +220,15 @@ def test_multiprocessing(model_class):
                 net_arch=[32],
                 features_extractor_kwargs=dict(cnn_output_dim=32),
             ),
+        )
+    elif model_class in {SAC, TD3, DQN}:
+        kwargs = dict(
+            buffer_size=1000,
+            policy_kwargs=dict(
+                net_arch=[32],
+                features_extractor_kwargs=dict(cnn_output_dim=16),
+            ),
+            train_freq=5,
         )
 
     model = model_class("MultiInputPolicy", env, gamma=0.5, seed=1, **kwargs)
@@ -259,8 +290,8 @@ def test_vec_normalize(model_class):
     Additional tests for PPO/A2C/SAC/DDPG/TD3/DQN to check observation space support
     for GoalEnv and VecNormalize using MultiInputPolicy.
     """
-    env = DummyVecEnv([lambda: BitFlippingEnv(n_bits=4, continuous=not (model_class == DQN))])
-    env = VecNormalize(env)
+    env = DummyVecEnv([lambda: gym.wrappers.TimeLimit(DummyDictEnv(use_discrete_actions=model_class == DQN), 100)])
+    env = VecNormalize(env, norm_obs_keys=["vec"])
 
     kwargs = {}
     n_steps = 256
@@ -307,3 +338,10 @@ def test_dict_nested():
 
     with pytest.raises(NotImplementedError):
         env = DummyVecEnv([lambda: DummyDictEnv(nested_dict_obs=True)])
+
+
+def test_vec_normalize_image():
+    env = VecNormalize(DummyVecEnv([lambda: DummyDictEnv()]), norm_obs_keys=["img"])
+    assert env.observation_space.spaces["img"].dtype == np.float32
+    assert (env.observation_space.spaces["img"].low == -env.clip_obs).all()
+    assert (env.observation_space.spaces["img"].high == env.clip_obs).all()
